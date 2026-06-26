@@ -148,6 +148,18 @@ struct uocr_trace_embedding {
     std::vector<float> first_values;
 };
 
+struct uocr_trace_output_embedding {
+    std::string phase;
+    int index = 0;
+    llama_token token_id = LLAMA_TOKEN_NULL;
+    int n_embd = 0;
+    double sum = 0.0;
+    double abs_sum = 0.0;
+    float min = 0.0f;
+    float max = 0.0f;
+    std::vector<float> first_values;
+};
+
 struct uocr_trace_generation_step {
     int index = 0;
     llama_token token_id = LLAMA_TOKEN_NULL;
@@ -172,13 +184,16 @@ struct uocr_trace {
     bool parse_special = true;
     int n_predict = 0;
     int n_vocab = 0;
+    int n_embd = 0;
     int n_embd_inp = 0;
     int n_ctx = 0;
+    bool output_embeddings_enabled = false;
     llama_pos prefill_n_past = 0;
     llama_pos final_n_past = 0;
     std::string stop_reason;
     std::vector<uocr_trace_chunk> chunks;
     std::vector<uocr_trace_embedding> embeddings;
+    std::vector<uocr_trace_output_embedding> output_embeddings;
     std::vector<uocr_trace_top_logit> prefill_top_logits;
     std::vector<uocr_trace_generation_step> generation;
 };
@@ -359,6 +374,35 @@ static uocr_trace_embedding summarize_embedding(
     return summary;
 }
 
+static uocr_trace_output_embedding summarize_output_embedding(
+        const std::string & phase,
+        int index,
+        llama_token token_id,
+        const float * embd,
+        int n_embd) {
+    uocr_trace_output_embedding summary;
+    summary.phase = phase;
+    summary.index = index;
+    summary.token_id = token_id;
+    summary.n_embd = n_embd;
+    if (embd == nullptr || n_embd <= 0) {
+        return summary;
+    }
+
+    summary.min = embd[0];
+    summary.max = embd[0];
+    const size_t n_first = std::min<size_t>(8, (size_t) n_embd);
+    summary.first_values.assign(embd, embd + n_first);
+    for (int i = 0; i < n_embd; ++i) {
+        const float value = embd[i];
+        summary.sum += value;
+        summary.abs_sum += std::fabs(value);
+        summary.min = std::min(summary.min, value);
+        summary.max = std::max(summary.max, value);
+    }
+    return summary;
+}
+
 static void write_uocr_trace(const uocr_trace & trace) {
     if (!trace.enabled || trace.path.empty()) {
         return;
@@ -394,8 +438,10 @@ static void write_uocr_trace(const uocr_trace & trace) {
     out << "  \"chat_template\": \"" << json_escape(trace.chat_template) << "\",\n";
     out << "  \"n_predict\": " << trace.n_predict << ",\n";
     out << "  \"n_vocab\": " << trace.n_vocab << ",\n";
+    out << "  \"n_embd\": " << trace.n_embd << ",\n";
     out << "  \"n_embd_inp\": " << trace.n_embd_inp << ",\n";
     out << "  \"n_ctx\": " << trace.n_ctx << ",\n";
+    out << "  \"output_embeddings_enabled\": " << (trace.output_embeddings_enabled ? "true" : "false") << ",\n";
     out << "  \"add_special\": " << (trace.add_special ? "true" : "false") << ",\n";
     out << "  \"parse_special\": " << (trace.parse_special ? "true" : "false") << ",\n";
     out << "  \"formatted_prompt\": \"" << json_escape(trace.formatted_prompt) << "\",\n";
@@ -458,6 +504,28 @@ static void write_uocr_trace(const uocr_trace & trace) {
             out << std::setprecision(9) << embd.first_values[j];
         }
         out << "]}" << (i + 1 == trace.embeddings.size() ? "\n" : ",\n");
+    }
+    out << "  ],\n";
+
+    out << "  \"output_embeddings\": [\n";
+    for (size_t i = 0; i < trace.output_embeddings.size(); ++i) {
+        const auto & embd = trace.output_embeddings[i];
+        out << "    {\"phase\":\"" << json_escape(embd.phase) << "\""
+            << ",\"index\":" << embd.index
+            << ",\"token_id\":" << embd.token_id
+            << ",\"n_embd\":" << embd.n_embd
+            << ",\"sum\":" << std::setprecision(12) << embd.sum
+            << ",\"abs_sum\":" << std::setprecision(12) << embd.abs_sum
+            << ",\"min\":" << std::setprecision(9) << embd.min
+            << ",\"max\":" << std::setprecision(9) << embd.max
+            << ",\"first_values\":[";
+        for (size_t j = 0; j < embd.first_values.size(); ++j) {
+            if (j) {
+                out << ",";
+            }
+            out << std::setprecision(9) << embd.first_values[j];
+        }
+        out << "]}" << (i + 1 == trace.output_embeddings.size() ? "\n" : ",\n");
     }
     out << "  ],\n";
 
@@ -614,6 +682,7 @@ struct mtmd_cli_context {
         if (trace.enabled) {
             trace.path = trace_path;
             trace.top_k = env_int("LLAMA_UOCR_PARITY_TOPK", 8);
+            trace.output_embeddings_enabled = env_enabled("LLAMA_UOCR_PARITY_OUTPUT_EMBEDDINGS");
             trace.tool = "llama-uocr-parity";
             trace.model_path = params.model.path;
             trace.mmproj_path = params.mmproj.path;
@@ -638,9 +707,14 @@ struct mtmd_cli_context {
             exit(1);
         }
 
+        if (trace.enabled && trace.output_embeddings_enabled) {
+            llama_set_embeddings(lctx, true);
+        }
+
         media_history_token = llama_vocab_n_tokens(vocab) + 1000000;
         if (trace.enabled) {
             trace.n_vocab = llama_vocab_n_tokens(vocab);
+            trace.n_embd = llama_model_n_embd(model);
             trace.n_embd_inp = llama_model_n_embd_inp(model);
             trace.n_ctx = llama_n_ctx(lctx);
         }
@@ -791,6 +865,14 @@ static int generate_response(mtmd_cli_context & ctx, int n_predict) {
             LOG_ERR("failed to decode token\n");
             return 1;
         }
+        if (ctx.trace.enabled && ctx.trace.output_embeddings_enabled) {
+            ctx.trace.output_embeddings.push_back(summarize_output_embedding(
+                        "generation",
+                        i,
+                        token_id,
+                        llama_get_embeddings_ith(ctx.lctx, -1),
+                        llama_model_n_embd(ctx.model)));
+        }
 
         if (!prune_decode_history(
                     ctx.lctx,
@@ -863,6 +945,7 @@ static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg) {
     if (ctx.trace.enabled) {
         ctx.trace.chunks.clear();
         ctx.trace.embeddings.clear();
+        ctx.trace.output_embeddings.clear();
         ctx.trace.prefill_top_logits.clear();
         ctx.trace.generation.clear();
         ctx.trace.stop_reason.clear();
@@ -994,6 +1077,14 @@ static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg) {
     if (ctx.trace.enabled) {
         ctx.trace.prefill_n_past = ctx.n_past;
         ctx.trace.prefill_top_logits = collect_top_logits(ctx.lctx, ctx.vocab, ctx.trace.top_k);
+        if (ctx.trace.output_embeddings_enabled) {
+            ctx.trace.output_embeddings.push_back(summarize_output_embedding(
+                        "prefill_last",
+                        0,
+                        LLAMA_TOKEN_NULL,
+                        llama_get_embeddings_ith(ctx.lctx, -1),
+                        llama_model_n_embd(ctx.model)));
+        }
     }
 
     LOG("\n");
