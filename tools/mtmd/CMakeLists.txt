@@ -134,6 +134,15 @@ if (LLAMA_BUILD_TOOLS)
     target_link_libraries  (${TARGET} PRIVATE llama-common mtmd Threads::Threads)
     target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
+    set(TARGET llama-uocr-parity)
+    add_executable         (${TARGET} mtmd-cli.cpp)
+    set_target_properties  (${TARGET} PROPERTIES OUTPUT_NAME llama-uocr-parity)
+    if(LLAMA_TOOLS_INSTALL)
+        install(TARGETS ${TARGET} RUNTIME)
+    endif()
+    target_link_libraries  (${TARGET} PRIVATE llama-common mtmd Threads::Threads)
+    target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
     # mtmd-debug tool
     add_executable(llama-mtmd-debug debug/mtmd-debug.cpp)
     set_target_properties(llama-mtmd-debug PROPERTIES OUTPUT_NAME llama-mtmd-debug)

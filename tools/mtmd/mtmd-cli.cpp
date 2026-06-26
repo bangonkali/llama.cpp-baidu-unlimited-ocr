@@ -11,11 +11,17 @@
 #include "mtmd-helper.h"
 
 #include <vector>
+#include <algorithm>
+#include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <limits.h>
 #include <cinttypes>
 #include <clocale>
 #include <cstdlib>
 #include <cstring>
+#include <sstream>
 #include <unordered_set>
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
@@ -110,6 +116,73 @@ struct mtmd_min_new_tokens {
     int n_tokens = 0;
 };
 
+struct uocr_trace_top_logit {
+    llama_token token_id = LLAMA_TOKEN_NULL;
+    float logit = 0.0f;
+    std::string piece;
+};
+
+struct uocr_trace_decoder_pos {
+    size_t index = 0;
+    mtmd_decoder_pos pos = {};
+};
+
+struct uocr_trace_chunk {
+    size_t index = 0;
+    std::string type;
+    size_t n_tokens = 0;
+    llama_pos n_pos = 0;
+    std::string id;
+    llama_tokens text_tokens;
+    std::vector<uocr_trace_decoder_pos> decoder_pos_sample;
+};
+
+struct uocr_trace_embedding {
+    size_t chunk_index = 0;
+    size_t n_tokens = 0;
+    int n_embd = 0;
+    double sum = 0.0;
+    double abs_sum = 0.0;
+    float min = 0.0f;
+    float max = 0.0f;
+    std::vector<float> first_values;
+};
+
+struct uocr_trace_generation_step {
+    int index = 0;
+    llama_token token_id = LLAMA_TOKEN_NULL;
+    std::string piece;
+    bool is_eog = false;
+    bool is_antiprompt = false;
+    int raw_top_rank = -1;
+    llama_tokens banned_tokens;
+    std::vector<uocr_trace_top_logit> top_logits;
+};
+
+struct uocr_trace {
+    bool enabled = false;
+    std::string path;
+    int top_k = 8;
+    std::string tool;
+    std::string model_path;
+    std::string mmproj_path;
+    std::string chat_template;
+    std::string formatted_prompt;
+    bool add_special = false;
+    bool parse_special = true;
+    int n_predict = 0;
+    int n_vocab = 0;
+    int n_embd_inp = 0;
+    int n_ctx = 0;
+    llama_pos prefill_n_past = 0;
+    llama_pos final_n_past = 0;
+    std::string stop_reason;
+    std::vector<uocr_trace_chunk> chunks;
+    std::vector<uocr_trace_embedding> embeddings;
+    std::vector<uocr_trace_top_logit> prefill_top_logits;
+    std::vector<uocr_trace_generation_step> generation;
+};
+
 static llama_tokens env_tokens(const char * name, llama_tokens fallback) {
     const char * value = std::getenv(name);
     if (value == nullptr || value[0] == '\0') {
@@ -131,6 +204,280 @@ static llama_tokens env_tokens(const char * name, llama_tokens fallback) {
         }
     }
     return tokens;
+}
+
+static std::string json_escape(const std::string & value) {
+    std::ostringstream out;
+    for (unsigned char ch : value) {
+        switch (ch) {
+            case '\\': out << "\\\\"; break;
+            case '"': out << "\\\""; break;
+            case '\b': out << "\\b"; break;
+            case '\f': out << "\\f"; break;
+            case '\n': out << "\\n"; break;
+            case '\r': out << "\\r"; break;
+            case '\t': out << "\\t"; break;
+            default:
+                if (ch < 0x20) {
+                    out << "\\u" << std::hex << std::setw(4) << std::setfill('0') << (int) ch << std::dec;
+                } else {
+                    out << ch;
+                }
+        }
+    }
+    return out.str();
+}
+
+static void json_write_tokens(std::ostream & out, const llama_tokens & tokens) {
+    out << "[";
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (i) {
+            out << ",";
+        }
+        out << tokens[i];
+    }
+    out << "]";
+}
+
+static void json_write_top_logits(std::ostream & out, const std::vector<uocr_trace_top_logit> & logits) {
+    out << "[";
+    for (size_t i = 0; i < logits.size(); ++i) {
+        if (i) {
+            out << ",";
+        }
+        out << "{\"token_id\":" << logits[i].token_id
+            << ",\"logit\":" << std::setprecision(9) << logits[i].logit
+            << ",\"piece\":\"" << json_escape(logits[i].piece) << "\"}";
+    }
+    out << "]";
+}
+
+static std::vector<uocr_trace_top_logit> collect_top_logits(
+        llama_context * lctx,
+        const llama_vocab * vocab,
+        int top_k) {
+    std::vector<uocr_trace_top_logit> top;
+    if (top_k <= 0) {
+        return top;
+    }
+
+    llama_synchronize(lctx);
+    const float * logits = llama_get_logits_ith(lctx, -1);
+    if (logits == nullptr) {
+        return top;
+    }
+
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    top.reserve((size_t) std::min(top_k, n_vocab));
+    for (llama_token token_id = 0; token_id < n_vocab; ++token_id) {
+        const float logit = logits[token_id];
+        if ((int) top.size() < top_k) {
+            top.push_back({token_id, logit, ""});
+            continue;
+        }
+        auto min_it = std::min_element(top.begin(), top.end(), [](const auto & a, const auto & b) {
+            return a.logit < b.logit;
+        });
+        if (min_it != top.end() && logit > min_it->logit) {
+            *min_it = {token_id, logit, ""};
+        }
+    }
+
+    std::sort(top.begin(), top.end(), [](const auto & a, const auto & b) {
+        return a.logit > b.logit;
+    });
+    for (auto & item : top) {
+        item.piece = common_token_to_piece(vocab, item.token_id, true);
+    }
+    return top;
+}
+
+static int rank_in_top_logits(const std::vector<uocr_trace_top_logit> & logits, llama_token token_id) {
+    for (size_t i = 0; i < logits.size(); ++i) {
+        if (logits[i].token_id == token_id) {
+            return (int) i;
+        }
+    }
+    return -1;
+}
+
+static std::string chunk_type_name(mtmd_input_chunk_type type) {
+    switch (type) {
+        case MTMD_INPUT_CHUNK_TYPE_TEXT:  return "text";
+        case MTMD_INPUT_CHUNK_TYPE_IMAGE: return "image";
+        case MTMD_INPUT_CHUNK_TYPE_AUDIO: return "audio";
+    }
+    return "unknown";
+}
+
+static std::vector<uocr_trace_decoder_pos> sample_decoder_positions(const mtmd_input_chunk * chunk) {
+    std::vector<uocr_trace_decoder_pos> sample;
+    const mtmd_image_tokens * image_tokens = mtmd_input_chunk_get_tokens_image(chunk);
+    if (image_tokens == nullptr) {
+        return sample;
+    }
+
+    const size_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
+    const size_t n_head = std::min<size_t>(4, n_tokens);
+    for (size_t i = 0; i < n_head; ++i) {
+        sample.push_back({i, mtmd_image_tokens_get_decoder_pos(image_tokens, 0, i)});
+    }
+    if (n_tokens > n_head) {
+        const size_t tail_start = n_tokens > 4 ? n_tokens - 4 : n_head;
+        for (size_t i = tail_start; i < n_tokens; ++i) {
+            sample.push_back({i, mtmd_image_tokens_get_decoder_pos(image_tokens, 0, i)});
+        }
+    }
+    return sample;
+}
+
+static uocr_trace_embedding summarize_embedding(
+        size_t chunk_index,
+        const float * embd,
+        size_t n_tokens,
+        int n_embd) {
+    uocr_trace_embedding summary;
+    summary.chunk_index = chunk_index;
+    summary.n_tokens = n_tokens;
+    summary.n_embd = n_embd;
+    if (embd == nullptr || n_tokens == 0 || n_embd <= 0) {
+        return summary;
+    }
+
+    const size_t n_values = n_tokens * (size_t) n_embd;
+    summary.min = embd[0];
+    summary.max = embd[0];
+    const size_t n_first = std::min<size_t>(8, n_values);
+    summary.first_values.assign(embd, embd + n_first);
+    for (size_t i = 0; i < n_values; ++i) {
+        const float value = embd[i];
+        summary.sum += value;
+        summary.abs_sum += std::fabs(value);
+        summary.min = std::min(summary.min, value);
+        summary.max = std::max(summary.max, value);
+    }
+    return summary;
+}
+
+static void write_uocr_trace(const uocr_trace & trace) {
+    if (!trace.enabled || trace.path.empty()) {
+        return;
+    }
+
+    std::filesystem::path path(trace.path);
+    if (path.has_parent_path()) {
+        std::filesystem::create_directories(path.parent_path());
+    }
+
+    std::ofstream out(path, std::ios::out | std::ios::trunc);
+    if (!out) {
+        LOG_WRN("%s: failed to open trace path '%s'\n", __func__, trace.path.c_str());
+        return;
+    }
+
+    size_t text_token_count = 0;
+    size_t media_token_count = 0;
+    for (const auto & chunk : trace.chunks) {
+        if (chunk.type == "text") {
+            text_token_count += chunk.n_tokens;
+        } else {
+            media_token_count += chunk.n_tokens;
+        }
+    }
+
+    out << "{\n";
+    out << "  \"schema_version\": 1,\n";
+    out << "  \"engine\": \"llamacpp\",\n";
+    out << "  \"tool\": \"" << json_escape(trace.tool) << "\",\n";
+    out << "  \"model_path\": \"" << json_escape(trace.model_path) << "\",\n";
+    out << "  \"mmproj_path\": \"" << json_escape(trace.mmproj_path) << "\",\n";
+    out << "  \"chat_template\": \"" << json_escape(trace.chat_template) << "\",\n";
+    out << "  \"n_predict\": " << trace.n_predict << ",\n";
+    out << "  \"n_vocab\": " << trace.n_vocab << ",\n";
+    out << "  \"n_embd_inp\": " << trace.n_embd_inp << ",\n";
+    out << "  \"n_ctx\": " << trace.n_ctx << ",\n";
+    out << "  \"add_special\": " << (trace.add_special ? "true" : "false") << ",\n";
+    out << "  \"parse_special\": " << (trace.parse_special ? "true" : "false") << ",\n";
+    out << "  \"formatted_prompt\": \"" << json_escape(trace.formatted_prompt) << "\",\n";
+    out << "  \"prefill_n_past\": " << trace.prefill_n_past << ",\n";
+    out << "  \"final_n_past\": " << trace.final_n_past << ",\n";
+    out << "  \"text_token_count\": " << text_token_count << ",\n";
+    out << "  \"media_token_count\": " << media_token_count << ",\n";
+    out << "  \"stop_reason\": \"" << json_escape(trace.stop_reason) << "\",\n";
+
+    out << "  \"prefill_top_logits\": ";
+    json_write_top_logits(out, trace.prefill_top_logits);
+    out << ",\n";
+
+    out << "  \"chunks\": [\n";
+    for (size_t i = 0; i < trace.chunks.size(); ++i) {
+        const auto & chunk = trace.chunks[i];
+        out << "    {\"index\":" << chunk.index
+            << ",\"type\":\"" << json_escape(chunk.type) << "\""
+            << ",\"n_tokens\":" << chunk.n_tokens
+            << ",\"n_pos\":" << chunk.n_pos
+            << ",\"id\":\"" << json_escape(chunk.id) << "\"";
+        if (!chunk.text_tokens.empty()) {
+            out << ",\"text_tokens\":";
+            json_write_tokens(out, chunk.text_tokens);
+        }
+        if (!chunk.decoder_pos_sample.empty()) {
+            out << ",\"decoder_pos_sample\":[";
+            for (size_t j = 0; j < chunk.decoder_pos_sample.size(); ++j) {
+                if (j) {
+                    out << ",";
+                }
+                const auto & sample = chunk.decoder_pos_sample[j];
+                out << "{\"index\":" << sample.index
+                    << ",\"t\":" << sample.pos.t
+                    << ",\"x\":" << sample.pos.x
+                    << ",\"y\":" << sample.pos.y
+                    << ",\"z\":" << sample.pos.z << "}";
+            }
+            out << "]";
+        }
+        out << "}" << (i + 1 == trace.chunks.size() ? "\n" : ",\n");
+    }
+    out << "  ],\n";
+
+    out << "  \"embeddings\": [\n";
+    for (size_t i = 0; i < trace.embeddings.size(); ++i) {
+        const auto & embd = trace.embeddings[i];
+        out << "    {\"chunk_index\":" << embd.chunk_index
+            << ",\"n_tokens\":" << embd.n_tokens
+            << ",\"n_embd\":" << embd.n_embd
+            << ",\"sum\":" << std::setprecision(12) << embd.sum
+            << ",\"abs_sum\":" << std::setprecision(12) << embd.abs_sum
+            << ",\"min\":" << std::setprecision(9) << embd.min
+            << ",\"max\":" << std::setprecision(9) << embd.max
+            << ",\"first_values\":[";
+        for (size_t j = 0; j < embd.first_values.size(); ++j) {
+            if (j) {
+                out << ",";
+            }
+            out << std::setprecision(9) << embd.first_values[j];
+        }
+        out << "]}" << (i + 1 == trace.embeddings.size() ? "\n" : ",\n");
+    }
+    out << "  ],\n";
+
+    out << "  \"generation\": [\n";
+    for (size_t i = 0; i < trace.generation.size(); ++i) {
+        const auto & step = trace.generation[i];
+        out << "    {\"index\":" << step.index
+            << ",\"token_id\":" << step.token_id
+            << ",\"piece\":\"" << json_escape(step.piece) << "\""
+            << ",\"is_eog\":" << (step.is_eog ? "true" : "false")
+            << ",\"is_antiprompt\":" << (step.is_antiprompt ? "true" : "false")
+            << ",\"raw_top_rank\":" << step.raw_top_rank
+            << ",\"banned_tokens\":";
+        json_write_tokens(out, step.banned_tokens);
+        out << ",\"top_logits\":";
+        json_write_top_logits(out, step.top_logits);
+        out << "}" << (i + 1 == trace.generation.size() ? "\n" : ",\n");
+    }
+    out << "  ]\n";
+    out << "}\n";
 }
 
 static llama_tokens banned_ngram_tokens(
@@ -241,6 +588,7 @@ struct mtmd_cli_context {
     llama_token media_history_token = LLAMA_TOKEN_NULL;
     llama_tokens eog_tokens;
     llama_tokens no_repeat_origin_tokens;
+    uocr_trace trace;
 
     common_debug_cb_user_data cb_data;
 
@@ -261,6 +609,17 @@ struct mtmd_cli_context {
         prefill_aware_swa.enabled = env_enabled("LLAMA_DEEPSEEK_OCR_PREFILL_AWARE_SWA");
         prefill_aware_swa.decode_window = env_int("LLAMA_DEEPSEEK_OCR_DECODE_WINDOW", 128);
         min_new_tokens.n_tokens = env_int("LLAMA_DEEPSEEK_OCR_MIN_NEW_TOKENS", 0);
+        const char * trace_path = std::getenv("LLAMA_UOCR_PARITY_DUMP");
+        trace.enabled = trace_path != nullptr && trace_path[0] != '\0';
+        if (trace.enabled) {
+            trace.path = trace_path;
+            trace.top_k = env_int("LLAMA_UOCR_PARITY_TOPK", 8);
+            trace.tool = "llama-uocr-parity";
+            trace.model_path = params.model.path;
+            trace.mmproj_path = params.mmproj.path;
+            trace.chat_template = params.chat_template;
+            trace.n_predict = params.n_predict;
+        }
         if (no_repeat_ngram.enabled) {
             LOG_INF("%s: DeepSeek-OCR no-repeat ngram enabled, ngram_size=%d, window_size=%d, whitelist_tokens=%zu\n",
                     __func__, no_repeat_ngram.ngram_size, no_repeat_ngram.window_size,
@@ -280,6 +639,11 @@ struct mtmd_cli_context {
         }
 
         media_history_token = llama_vocab_n_tokens(vocab) + 1000000;
+        if (trace.enabled) {
+            trace.n_vocab = llama_vocab_n_tokens(vocab);
+            trace.n_embd_inp = llama_model_n_embd_inp(model);
+            trace.n_ctx = llama_n_ctx(lctx);
+        }
         for (llama_token token_id = 0; token_id < llama_vocab_n_tokens(vocab); token_id++) {
             if (llama_vocab_is_eog(vocab, token_id)) {
                 eog_tokens.push_back(token_id);
@@ -366,6 +730,9 @@ static int generate_response(mtmd_cli_context & ctx, int n_predict) {
     for (int i = 0; i < n_predict; i++) {
         if (i > n_predict || !g_is_generating || g_is_interrupted) {
             LOG("\n");
+            if (ctx.trace.stop_reason.empty()) {
+                ctx.trace.stop_reason = g_is_interrupted ? "interrupted" : "stopped";
+            }
             break;
         }
 
@@ -376,13 +743,35 @@ static int generate_response(mtmd_cli_context & ctx, int n_predict) {
         if (i < ctx.min_new_tokens.n_tokens) {
             banned.insert(banned.end(), ctx.eog_tokens.begin(), ctx.eog_tokens.end());
         }
+        std::vector<uocr_trace_top_logit> top_logits;
+        if (ctx.trace.enabled) {
+            top_logits = collect_top_logits(ctx.lctx, ctx.vocab, ctx.trace.top_k);
+        }
         llama_token token_id = banned.empty()
             ? common_sampler_sample(ctx.smpl, ctx.lctx, -1)
             : common_sampler_sample_with_banned(ctx.smpl, ctx.lctx, -1, banned);
         generated_tokens.push_back(token_id);
         common_sampler_accept(ctx.smpl, token_id, true);
+        const bool is_eog = llama_vocab_is_eog(ctx.vocab, token_id);
+        const bool is_antiprompt = ctx.check_antiprompt(generated_tokens);
 
-        if (llama_vocab_is_eog(ctx.vocab, token_id) || ctx.check_antiprompt(generated_tokens)) {
+        if (ctx.trace.enabled) {
+            uocr_trace_generation_step step;
+            step.index = i;
+            step.token_id = token_id;
+            step.piece = common_token_to_piece(ctx.lctx, token_id);
+            step.is_eog = is_eog;
+            step.is_antiprompt = is_antiprompt;
+            step.raw_top_rank = rank_in_top_logits(top_logits, token_id);
+            step.banned_tokens = banned;
+            step.top_logits = std::move(top_logits);
+            ctx.trace.generation.push_back(std::move(step));
+        }
+
+        if (is_eog || is_antiprompt) {
+            if (ctx.trace.stop_reason.empty()) {
+                ctx.trace.stop_reason = is_eog ? "eog" : "antiprompt";
+            }
             LOG("\n");
             break; // end of generation
         }
@@ -412,6 +801,9 @@ static int generate_response(mtmd_cli_context & ctx, int n_predict) {
             return 1;
         }
     }
+    if (ctx.trace.enabled && ctx.trace.stop_reason.empty()) {
+        ctx.trace.stop_reason = generated_tokens.size() >= (size_t) n_predict ? "length" : "stopped";
+    }
 
     std::string generated_text = common_detokenize(ctx.lctx, generated_tokens);
     common_chat_msg msg;
@@ -438,6 +830,11 @@ static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg) {
     bool add_bos = ctx.chat_history.empty();
     auto formatted_chat = chat_add_and_format(ctx, msg);
     LOG_DBG("formatted_chat.prompt: %s\n", formatted_chat.c_str());
+    if (ctx.trace.enabled) {
+        ctx.trace.formatted_prompt = formatted_chat;
+        ctx.trace.add_special = add_bos;
+        ctx.trace.parse_special = true;
+    }
 
     mtmd_input_text text;
     text.text          = formatted_chat.c_str();
@@ -463,6 +860,31 @@ static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg) {
 
     // batch encode all media chunks, then decode each
     size_t n_chunks = mtmd_input_chunks_size(chunks.ptr.get());
+    if (ctx.trace.enabled) {
+        ctx.trace.chunks.clear();
+        ctx.trace.embeddings.clear();
+        ctx.trace.prefill_top_logits.clear();
+        ctx.trace.generation.clear();
+        ctx.trace.stop_reason.clear();
+        for (size_t i = 0; i < n_chunks; ++i) {
+            auto chunk = mtmd_input_chunks_get(chunks.ptr.get(), i);
+            uocr_trace_chunk trace_chunk;
+            trace_chunk.index = i;
+            trace_chunk.type = chunk_type_name(mtmd_input_chunk_get_type(chunk));
+            trace_chunk.n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
+            trace_chunk.n_pos = mtmd_input_chunk_get_n_pos(chunk);
+            const char * id = mtmd_input_chunk_get_id(chunk);
+            trace_chunk.id = id ? id : "";
+            if (mtmd_input_chunk_get_type(chunk) == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+                size_t n_text_tokens = 0;
+                const llama_token * text_tokens = mtmd_input_chunk_get_tokens_text(chunk, &n_text_tokens);
+                trace_chunk.text_tokens.assign(text_tokens, text_tokens + n_text_tokens);
+            } else if (mtmd_input_chunk_get_type(chunk) == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+                trace_chunk.decoder_pos_sample = sample_decoder_positions(chunk);
+            }
+            ctx.trace.chunks.push_back(std::move(trace_chunk));
+        }
+    }
     for (size_t i = 0; i < n_chunks; i++) {
         auto chunk = mtmd_input_chunks_get(chunks.ptr.get(), i);
         auto chunk_type = mtmd_input_chunk_get_type(chunk);
@@ -542,6 +964,13 @@ static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg) {
             }
 
             GGML_ASSERT(embd != nullptr);
+            if (ctx.trace.enabled) {
+                ctx.trace.embeddings.push_back(summarize_embedding(
+                            i,
+                            embd,
+                            mtmd_input_chunk_get_n_tokens(chunk),
+                            llama_model_n_embd_inp(ctx.model)));
+            }
 
             llama_pos new_n_past = ctx.n_past;
             res = mtmd_helper_decode_image_chunk(ctx.ctx_vision.get(),
@@ -561,6 +990,10 @@ static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg) {
             }
             ctx.n_past = new_n_past;
         }
+    }
+    if (ctx.trace.enabled) {
+        ctx.trace.prefill_n_past = ctx.n_past;
+        ctx.trace.prefill_top_logits = collect_top_logits(ctx.lctx, ctx.vocab, ctx.trace.top_k);
     }
 
     LOG("\n");
@@ -740,5 +1173,9 @@ int main(int argc, char ** argv) {
     if (g_is_interrupted) LOG("\nInterrupted by user\n");
     LOG("\n\n");
     llama_perf_context_print(ctx.lctx);
+    if (ctx.trace.enabled) {
+        ctx.trace.final_n_past = ctx.n_past;
+        write_uocr_trace(ctx.trace);
+    }
     return g_is_interrupted ? 130 : 0;
 }
