@@ -14,6 +14,16 @@ void llama_model_deepseek2ocr::load_arch_hparams(llama_model_loader & ml) {
         hparams.expert_gating_func = LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX;
     }
 
+    ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false);
+    if (hparams.n_swa == 0 && name == "Unlimited OCR") {
+        hparams.n_swa = 128;
+        LLAMA_LOG_WARN("%s: missing sliding-window metadata for `%s`; using Unlimited-OCR R-SWA fallback n_swa=%u\n",
+                __func__, name.c_str(), hparams.n_swa);
+    }
+    if (hparams.n_swa > 0) {
+        hparams.swa_type = LLAMA_SWA_TYPE_REFERENCE;
+    }
+
     switch (hparams.n_layer()) {
         case 12: type = LLM_TYPE_3B; break;
         default: type = LLM_TYPE_UNKNOWN;
@@ -79,4 +89,3 @@ void llama_model_deepseek2ocr::load_arch_tensors(llama_model_loader &) {
 std::unique_ptr<llm_graph_context> llama_model_deepseek2ocr::build_arch_graph(const llm_graph_params & params) const {
     return std::make_unique<graph>(*this, params);
 }
-

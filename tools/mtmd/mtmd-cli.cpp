@@ -109,6 +109,7 @@ struct mtmd_no_repeat_ngram {
 
 struct mtmd_prefill_aware_swa {
     bool enabled = false;
+    bool legacy_kv_prune = false;
     int decode_window = 128;
 };
 
@@ -605,6 +606,9 @@ static bool prune_decode_history(
     if (!config.enabled || config.decode_window <= 0) {
         return true;
     }
+    if (!config.legacy_kv_prune) {
+        return true;
+    }
 
     const llama_pos remove_start = std::max(prefill_end, removed_until);
     const llama_pos remove_end = n_past - config.decode_window;
@@ -675,6 +679,7 @@ struct mtmd_cli_context {
                 "LLAMA_DEEPSEEK_OCR_NGRAM_WHITELIST",
                 no_repeat_ngram.whitelist_tokens);
         prefill_aware_swa.enabled = env_enabled("LLAMA_DEEPSEEK_OCR_PREFILL_AWARE_SWA");
+        prefill_aware_swa.legacy_kv_prune = env_enabled("LLAMA_DEEPSEEK_OCR_LEGACY_KV_PRUNE");
         prefill_aware_swa.decode_window = env_int("LLAMA_DEEPSEEK_OCR_DECODE_WINDOW", 128);
         min_new_tokens.n_tokens = env_int("LLAMA_DEEPSEEK_OCR_MIN_NEW_TOKENS", 0);
         const char * trace_path = std::getenv("LLAMA_UOCR_PARITY_DUMP");
@@ -695,8 +700,8 @@ struct mtmd_cli_context {
                     no_repeat_ngram.whitelist_tokens.size());
         }
         if (prefill_aware_swa.enabled) {
-            LOG_INF("%s: DeepSeek-OCR prefill-aware SWA enabled, decode_window=%d\n",
-                    __func__, prefill_aware_swa.decode_window);
+            LOG_INF("%s: DeepSeek-OCR prefill-aware SWA flag enabled; core R-SWA handles masking, legacy KV prune=%d, decode_window=%d\n",
+                    __func__, (int) prefill_aware_swa.legacy_kv_prune, prefill_aware_swa.decode_window);
         }
         if (min_new_tokens.n_tokens > 0) {
             LOG_INF("%s: DeepSeek-OCR min-new-tokens experiment enabled, n_tokens=%d\n",

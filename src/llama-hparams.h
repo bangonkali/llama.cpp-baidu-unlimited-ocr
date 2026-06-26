@@ -21,6 +21,8 @@ enum llama_swa_type {
     LLAMA_SWA_TYPE_STANDARD  = 1,
     LLAMA_SWA_TYPE_CHUNKED   = 2,
     LLAMA_SWA_TYPE_SYMMETRIC = 3,
+    // R-SWA: always-visible reference prefix plus a sliding window over generated tokens.
+    LLAMA_SWA_TYPE_REFERENCE = 4,
 };
 
 // forward declaration; full definition in llama-graph.h
@@ -357,7 +359,7 @@ struct llama_hparams {
     // note: inlined on purpose for performance reasons
     // TODO: think of a better place for this function
     // TODO: pack the SWA params in a struct?
-    static bool is_masked_swa(uint32_t n_swa, llama_swa_type swa_type, llama_pos p0, llama_pos p1) {
+    static bool is_masked_swa(uint32_t n_swa, llama_swa_type swa_type, llama_pos p0, llama_pos p1, llama_pos n_ref = -1) {
         assert(p0 >= 0 && p1 >= 0);
 
         switch (swa_type) {
@@ -385,6 +387,15 @@ struct llama_hparams {
 
                     // Mask if outside the symmetric window
                     if (pos_diff < -half_n_swa || pos_diff > half_n_swa) {
+                        return true;
+                    }
+                } break;
+            case LLAMA_SWA_TYPE_REFERENCE:
+                {
+                    const bool windowed  = p1 - p0 >= (int32_t) n_swa;
+                    const bool in_prefix = n_ref < 0 || p0 < n_ref;
+
+                    if (windowed && !in_prefix) {
                         return true;
                     }
                 } break;

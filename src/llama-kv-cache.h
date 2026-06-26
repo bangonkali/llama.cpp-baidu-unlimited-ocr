@@ -5,6 +5,7 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <array>
 #include <unordered_map>
 #include <vector>
 
@@ -258,6 +259,9 @@ private:
 
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
+
+    // R-SWA per-sequence reference-prefix length (-1 means unlatched/full causal).
+    std::array<llama_pos, LLAMA_MAX_SEQ> n_ref;
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
