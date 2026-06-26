@@ -272,6 +272,11 @@ mtmd_context_params mtmd_context_params_default() {
     return params;
 }
 
+static bool mtmd_env_enabled(const char * name) {
+    const char * value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
 struct mtmd_context {
     struct clip_ctx * ctx_v; // vision
     struct clip_ctx * ctx_a; // audio
@@ -634,13 +639,13 @@ struct mtmd_context {
                 } break;
             case PROJECTOR_TYPE_DEEPSEEKOCR:
                 {
-                    img_end = "\n"; // prevent empty batch on llama-server
+                    img_end = mtmd_env_enabled("LLAMA_DEEPSEEK_OCR_NO_IMAGE_END") ? "" : "\n"; // prevent empty batch on llama-server
                     image_preproc = std::make_unique<mtmd_image_preprocessor_deepseekocr>(ctx_v);
                     ov_img_first = false;
                 } break;
             case PROJECTOR_TYPE_DEEPSEEKOCR2:
                 {
-                    img_end = "\n"; // prevent empty batch on llama-server
+                    img_end = mtmd_env_enabled("LLAMA_DEEPSEEK_OCR_NO_IMAGE_END") ? "" : "\n"; // prevent empty batch on llama-server
                     image_preproc = std::make_unique<mtmd_image_preprocessor_deepseekocr2>(ctx_v);
                     ov_img_first = false;
                 } break;

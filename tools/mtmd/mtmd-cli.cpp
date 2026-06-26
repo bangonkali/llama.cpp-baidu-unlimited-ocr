@@ -14,6 +14,9 @@
 #include <limits.h>
 #include <cinttypes>
 #include <clocale>
+#include <cstdlib>
+#include <cstring>
+#include <unordered_set>
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
 #include <signal.h>
@@ -73,6 +76,138 @@ static void inject_test_response_marker() {
     }
 }
 
+static int env_int(const char * name, int fallback) {
+    const char * value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return fallback;
+    }
+    char * end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (end == value) {
+        return fallback;
+    }
+    return (int) parsed;
+}
+
+static bool env_enabled(const char * name) {
+    const char * value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+struct mtmd_no_repeat_ngram {
+    bool enabled = false;
+    int ngram_size = 30;
+    int window_size = 90;
+    llama_tokens whitelist_tokens = {128821, 128822};
+};
+
+struct mtmd_prefill_aware_swa {
+    bool enabled = false;
+    int decode_window = 128;
+};
+
+struct mtmd_min_new_tokens {
+    int n_tokens = 0;
+};
+
+static llama_tokens env_tokens(const char * name, llama_tokens fallback) {
+    const char * value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return fallback;
+    }
+
+    llama_tokens tokens;
+    const char * cursor = value;
+    while (*cursor != '\0') {
+        char * end = nullptr;
+        const long parsed = std::strtol(cursor, &end, 10);
+        if (end == cursor) {
+            break;
+        }
+        tokens.push_back((llama_token) parsed);
+        cursor = end;
+        while (*cursor == ',' || *cursor == ' ' || *cursor == '\t' || *cursor == '\n') {
+            cursor++;
+        }
+    }
+    return tokens;
+}
+
+static llama_tokens banned_ngram_tokens(
+        const llama_tokens & origin_tokens,
+        const llama_tokens & generated_tokens,
+        const mtmd_no_repeat_ngram & config) {
+    llama_tokens banned;
+    const int ngram_size = config.ngram_size;
+    const int window_size = config.window_size;
+    if (!config.enabled || ngram_size <= 0 || window_size <= 0) {
+        return banned;
+    }
+
+    llama_tokens tokens;
+    tokens.reserve(origin_tokens.size() + generated_tokens.size());
+    tokens.insert(tokens.end(), origin_tokens.begin(), origin_tokens.end());
+    tokens.insert(tokens.end(), generated_tokens.begin(), generated_tokens.end());
+
+    if ((int) tokens.size() < ngram_size) {
+        return banned;
+    }
+
+    const int search_start = std::max(0, (int) tokens.size() - window_size);
+    const int search_end = (int) tokens.size() - ngram_size + 1;
+    if (search_end <= search_start) {
+        return banned;
+    }
+
+    std::unordered_set<llama_token> banned_set;
+    for (int idx = search_start; idx < search_end; ++idx) {
+        bool matches = true;
+        for (int offset = 0; offset < ngram_size - 1; ++offset) {
+            if (tokens[idx + offset] != tokens[tokens.size() - (ngram_size - 1) + offset]) {
+                matches = false;
+                break;
+            }
+        }
+        if (matches) {
+            banned_set.insert(tokens[idx + ngram_size - 1]);
+        }
+    }
+
+    for (const llama_token token : config.whitelist_tokens) {
+        banned_set.erase(token);
+    }
+
+    banned.assign(banned_set.begin(), banned_set.end());
+    return banned;
+}
+
+static bool prune_decode_history(
+        llama_context * lctx,
+        const mtmd_prefill_aware_swa & config,
+        llama_pos prefill_end,
+        llama_pos n_past,
+        llama_pos & removed_until) {
+    if (!config.enabled || config.decode_window <= 0) {
+        return true;
+    }
+
+    const llama_pos remove_start = std::max(prefill_end, removed_until);
+    const llama_pos remove_end = n_past - config.decode_window;
+    if (remove_end <= remove_start) {
+        return true;
+    }
+
+    llama_memory_t mem = llama_get_memory(lctx);
+    if (!llama_memory_seq_rm(mem, 0, remove_start, remove_end)) {
+        LOG_WRN("%s: failed to prune generated KV positions [%d, %d)\n",
+                __func__, (int) remove_start, (int) remove_end);
+        return false;
+    }
+
+    removed_until = remove_end;
+    return true;
+}
+
 struct mtmd_cli_context {
     mtmd::context_ptr ctx_vision;
     common_init_result_ptr llama_init;
@@ -100,6 +235,12 @@ struct mtmd_cli_context {
 
     int n_threads    = 1;
     llama_pos n_past = 0;
+    mtmd_no_repeat_ngram no_repeat_ngram;
+    mtmd_prefill_aware_swa prefill_aware_swa;
+    mtmd_min_new_tokens min_new_tokens;
+    llama_token media_history_token = LLAMA_TOKEN_NULL;
+    llama_tokens eog_tokens;
+    llama_tokens no_repeat_origin_tokens;
 
     common_debug_cb_user_data cb_data;
 
@@ -111,9 +252,38 @@ struct mtmd_cli_context {
         n_threads = params.cpuparams.n_threads;
         batch = llama_batch_init(1, 0, 1); // batch for next token generation
         n_batch = params.n_batch;
+        no_repeat_ngram.enabled = env_enabled("LLAMA_DEEPSEEK_OCR_NO_REPEAT_NGRAM");
+        no_repeat_ngram.ngram_size = env_int("LLAMA_DEEPSEEK_OCR_NGRAM_SIZE", 30);
+        no_repeat_ngram.window_size = env_int("LLAMA_DEEPSEEK_OCR_NGRAM_WINDOW", 90);
+        no_repeat_ngram.whitelist_tokens = env_tokens(
+                "LLAMA_DEEPSEEK_OCR_NGRAM_WHITELIST",
+                no_repeat_ngram.whitelist_tokens);
+        prefill_aware_swa.enabled = env_enabled("LLAMA_DEEPSEEK_OCR_PREFILL_AWARE_SWA");
+        prefill_aware_swa.decode_window = env_int("LLAMA_DEEPSEEK_OCR_DECODE_WINDOW", 128);
+        min_new_tokens.n_tokens = env_int("LLAMA_DEEPSEEK_OCR_MIN_NEW_TOKENS", 0);
+        if (no_repeat_ngram.enabled) {
+            LOG_INF("%s: DeepSeek-OCR no-repeat ngram enabled, ngram_size=%d, window_size=%d, whitelist_tokens=%zu\n",
+                    __func__, no_repeat_ngram.ngram_size, no_repeat_ngram.window_size,
+                    no_repeat_ngram.whitelist_tokens.size());
+        }
+        if (prefill_aware_swa.enabled) {
+            LOG_INF("%s: DeepSeek-OCR prefill-aware SWA enabled, decode_window=%d\n",
+                    __func__, prefill_aware_swa.decode_window);
+        }
+        if (min_new_tokens.n_tokens > 0) {
+            LOG_INF("%s: DeepSeek-OCR min-new-tokens experiment enabled, n_tokens=%d\n",
+                    __func__, min_new_tokens.n_tokens);
+        }
 
         if (!model || !lctx) {
             exit(1);
+        }
+
+        media_history_token = llama_vocab_n_tokens(vocab) + 1000000;
+        for (llama_token token_id = 0; token_id < llama_vocab_n_tokens(vocab); token_id++) {
+            if (llama_vocab_is_eog(vocab, token_id)) {
+                eog_tokens.push_back(token_id);
+            }
         }
 
         if (!llama_model_chat_template(model, nullptr) && params.chat_template.empty()) {
@@ -191,13 +361,24 @@ struct mtmd_cli_context {
 
 static int generate_response(mtmd_cli_context & ctx, int n_predict) {
     llama_tokens generated_tokens;
+    const llama_pos prefill_end = ctx.n_past;
+    llama_pos decode_kv_removed_until = prefill_end;
     for (int i = 0; i < n_predict; i++) {
         if (i > n_predict || !g_is_generating || g_is_interrupted) {
             LOG("\n");
             break;
         }
 
-        llama_token token_id = common_sampler_sample(ctx.smpl, ctx.lctx, -1);
+        llama_tokens banned = banned_ngram_tokens(
+                ctx.no_repeat_origin_tokens,
+                generated_tokens,
+                ctx.no_repeat_ngram);
+        if (i < ctx.min_new_tokens.n_tokens) {
+            banned.insert(banned.end(), ctx.eog_tokens.begin(), ctx.eog_tokens.end());
+        }
+        llama_token token_id = banned.empty()
+            ? common_sampler_sample(ctx.smpl, ctx.lctx, -1)
+            : common_sampler_sample_with_banned(ctx.smpl, ctx.lctx, -1, banned);
         generated_tokens.push_back(token_id);
         common_sampler_accept(ctx.smpl, token_id, true);
 
@@ -219,6 +400,15 @@ static int generate_response(mtmd_cli_context & ctx, int n_predict) {
         common_batch_add(ctx.batch, token_id, ctx.n_past++, {0}, true);
         if (llama_decode(ctx.lctx, ctx.batch)) {
             LOG_ERR("failed to decode token\n");
+            return 1;
+        }
+
+        if (!prune_decode_history(
+                    ctx.lctx,
+                    ctx.prefill_aware_swa,
+                    prefill_end,
+                    ctx.n_past,
+                    decode_kv_removed_until)) {
             return 1;
         }
     }
@@ -278,6 +468,13 @@ static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg) {
         auto chunk_type = mtmd_input_chunk_get_type(chunk);
 
         if (chunk_type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+            size_t n_text_tokens = 0;
+            const llama_token * text_tokens = mtmd_input_chunk_get_tokens_text(chunk, &n_text_tokens);
+            ctx.no_repeat_origin_tokens.insert(
+                    ctx.no_repeat_origin_tokens.end(),
+                    text_tokens,
+                    text_tokens + n_text_tokens);
+
             // decode text chunk
             llama_pos new_n_past = ctx.n_past;
             res = mtmd_helper_eval_chunk_single(ctx.ctx_vision.get(),
@@ -294,6 +491,11 @@ static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg) {
             }
             ctx.n_past = new_n_past;
         } else {
+            ctx.no_repeat_origin_tokens.insert(
+                    ctx.no_repeat_origin_tokens.end(),
+                    mtmd_input_chunk_get_n_tokens(chunk),
+                    ctx.media_history_token);
+
             // media chunk: try to get embd from existing batch, or create a new batch
             float * embd = nullptr;
             if (ctx.mbatch) {

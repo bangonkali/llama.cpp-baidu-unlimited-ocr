@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstring>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // the ring buffer works similarly to std::deque, but with a fixed capacity
@@ -537,7 +538,34 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
-llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
+static bool common_sampler_is_banned(const llama_tokens * banned, llama_token id) {
+    if (banned == nullptr || banned->empty()) {
+        return false;
+    }
+    return std::find(banned->begin(), banned->end(), id) != banned->end();
+}
+
+static void common_sampler_apply_banned(llama_token_data_array & cur_p, const llama_tokens * banned) {
+    if (banned == nullptr || banned->empty()) {
+        return;
+    }
+
+    std::unordered_set<llama_token> banned_set(banned->begin(), banned->end());
+    for (size_t i = 0; i < cur_p.size; ++i) {
+        if (banned_set.find(cur_p.data[i].id) != banned_set.end()) {
+            cur_p.data[i].logit = -INFINITY;
+        }
+    }
+    cur_p.selected = -1;
+    cur_p.sorted = false;
+}
+
+static llama_token common_sampler_sample_impl(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        int idx,
+        const llama_tokens * banned,
+        bool grammar_first) {
     llama_synchronize(ctx);
 
     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
@@ -557,7 +585,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     {
         id = llama_get_sampled_token_ith(ctx, idx);
 
-        if (id != LLAMA_TOKEN_NULL) {
+        if (id != LLAMA_TOKEN_NULL && !common_sampler_is_banned(banned, id)) {
             LOG_DBG("%s: Backend sampler selected token: '%d'. Will not run any CPU samplers\n", __func__, id);
 
             GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
@@ -573,6 +601,8 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
             return id;
         }
     }
+
+    common_sampler_apply_banned(cur_p, banned);
 
     // apply reasoning budget first
     llama_sampler_apply(rbudget, &cur_p);
@@ -605,6 +635,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     // resampling:
     // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
     gsmpl->set_logits(ctx, idx);
+    common_sampler_apply_banned(cur_p, banned);
 
     llama_sampler_apply(rbudget,  &cur_p);
 
@@ -619,6 +650,19 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     id = cur_p.data[cur_p.selected].id;
 
     return id;
+}
+
+llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
+    return common_sampler_sample_impl(gsmpl, ctx, idx, nullptr, grammar_first);
+}
+
+llama_token common_sampler_sample_with_banned(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        int idx,
+        const llama_tokens & banned,
+        bool grammar_first) {
+    return common_sampler_sample_impl(gsmpl, ctx, idx, &banned, grammar_first);
 }
 
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
