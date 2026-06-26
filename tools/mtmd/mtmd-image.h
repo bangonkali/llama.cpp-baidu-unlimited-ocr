@@ -161,8 +161,21 @@ struct mtmd_image_preprocessor_internvl : mtmd_image_preprocessor_llava_uhd {
 };
 
 struct mtmd_image_preprocessor_deepseekocr : mtmd_image_preprocessor {
+    static constexpr int base_size = 1024;
+    static constexpr int tile_size = 640;
+    static constexpr int min_tiles = 2;
+    static constexpr int max_tiles = 32;
+
     mtmd_image_preprocessor_deepseekocr(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) override;
+
+private:
+    static std::vector<clip_image_size> get_target_ratios();
+    static clip_image_size              find_closest_aspect_ratio(
+        float                                aspect_ratio,
+        const std::vector<clip_image_size> & target_ratios,
+        int                                  width,
+        int                                  height);
 };
 
 // DeepSeek-OCR-2: a 1024x1024 global view, plus InternVL-style 768x768 local

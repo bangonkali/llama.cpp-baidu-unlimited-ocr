@@ -312,7 +312,9 @@ ggml_cgraph * clip_graph_deepseekocr::build() {
     imgnl = ggml_repeat_4d(ctx0, model.image_newline, n_dim, 1, h, 1);
     cur   = ggml_reshape_3d(ctx0, cur, n_dim, w, h);
     cur   = ggml_reshape_2d(ctx0, ggml_concat(ctx0, cur, imgnl, 1), n_dim, (w + 1) * h);
-    cur   = ggml_concat(ctx0, cur, model.view_seperator, 1);  // (n_dim, h*(w+1) + 1)
+    if (img.add_viewsep) {
+        cur = ggml_concat(ctx0, cur, model.view_seperator, 1);  // (n_dim, h*(w+1) + 1)
+    }
 
     cb(cur, "dsocr_output", -1);
 

@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <limits>
 #include <vector>
 
 void mtmd_image_preproc_out::append(const clip_hparams & hparams, const clip_image_u8 & img, bool normalized) {
@@ -1107,7 +1109,99 @@ mtmd_image_preproc_out mtmd_image_preprocessor_internvl::preprocess(const clip_i
 // mtmd_image_preprocessor_deepseekocr
 //
 
+static bool deepseekocr_gundam_enabled() {
+    const char * value = std::getenv("LLAMA_DEEPSEEK_OCR_GUNDAM");
+    if (value == nullptr) {
+        return false;
+    }
+    return std::string(value) == "1" || std::string(value) == "true" || std::string(value) == "TRUE";
+}
+
+std::vector<clip_image_size> mtmd_image_preprocessor_deepseekocr::get_target_ratios() {
+    std::vector<clip_image_size> ratios;
+    for (int n = min_tiles; n <= max_tiles; n++) {
+        for (int w = 1; w <= n; w++) {
+            for (int h = 1; h <= n; h++) {
+                if (w * h < min_tiles || w * h > max_tiles) {
+                    continue;
+                }
+                bool found = false;
+                for (const auto & r : ratios) {
+                    if (r.width == w && r.height == h) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    ratios.push_back({ w, h });
+                }
+            }
+        }
+    }
+    std::sort(ratios.begin(), ratios.end(), [](const clip_image_size & a, const clip_image_size & b) {
+        return a.width * a.height < b.width * b.height;
+    });
+    return ratios;
+}
+
+clip_image_size mtmd_image_preprocessor_deepseekocr::find_closest_aspect_ratio(
+    float                                aspect_ratio,
+    const std::vector<clip_image_size> & target_ratios,
+    int                                  width,
+    int                                  height) {
+    float           best_ratio_diff = std::numeric_limits<float>::max();
+    clip_image_size best_ratio      = { 1, 1 };
+    const float     area            = static_cast<float>(width * height);
+
+    for (const auto & ratio : target_ratios) {
+        const float target_aspect_ratio = static_cast<float>(ratio.width) / ratio.height;
+        const float ratio_diff          = std::abs(aspect_ratio - target_aspect_ratio);
+        if (ratio_diff < best_ratio_diff) {
+            best_ratio_diff = ratio_diff;
+            best_ratio      = ratio;
+        } else if (ratio_diff == best_ratio_diff) {
+            const float target_area = static_cast<float>(tile_size * tile_size * ratio.width * ratio.height);
+            if (area > 0.5f * target_area) {
+                best_ratio = ratio;
+            }
+        }
+    }
+    return best_ratio;
+}
+
 mtmd_image_preproc_out mtmd_image_preprocessor_deepseekocr::preprocess(const clip_image_u8 & img) {
+    if (deepseekocr_gundam_enabled()) {
+        mtmd_image_preproc_out output;
+        const auto             img_size = img.get_size();
+
+        if (img_size.width > tile_size || img_size.height > tile_size) {
+            const float           aspect_ratio  = static_cast<float>(img_size.width) / img_size.height;
+            const auto            target_ratios = get_target_ratios();
+            const clip_image_size grid          = find_closest_aspect_ratio(aspect_ratio, target_ratios, img_size.width, img_size.height);
+
+            clip_image_u8 refined;
+            img_tool::resize(img, refined, { tile_size * grid.width, tile_size * grid.height },
+                             RESIZE_ALGO_BICUBIC_PILLOW, PAD_NONE);
+
+            for (int row = 0; row < grid.height; row++) {
+                for (int col = 0; col < grid.width; col++) {
+                    clip_image_u8 tile;
+                    img_tool::crop(refined, tile, col * tile_size, row * tile_size, tile_size, tile_size);
+                    output.append(hparams, tile, true);
+                }
+            }
+            output.grid_x = grid.width;
+            output.grid_y = grid.height;
+        }
+
+        clip_image_u8 padded;
+        img_tool::resize(img, padded, { base_size, base_size }, RESIZE_ALGO_BICUBIC_PILLOW,
+                         PAD_NEAREST, hparams.image_pad_color);
+        output.append_overview(hparams, padded, true);
+        output.overview.add_viewsep = true;
+        return output;
+    }
+
     static constexpr int native_resolutions[] = { 1024 /* base */, 1280 /* large */ };
     // TODO: support 512 (tiny) and 640 (small) once we have eval data for them
 
@@ -1132,6 +1226,7 @@ mtmd_image_preproc_out mtmd_image_preprocessor_deepseekocr::preprocess(const cli
                      PAD_NEAREST, hparams.image_pad_color);
     mtmd_image_preproc_out output;
     output.append_overview(hparams, padded, true);
+    output.overview.add_viewsep = true;
     output.grid_x = 0;
     output.grid_y = 0;
     // TODO @ngxson : support slicing for DeepSeek-OCR, to do in another PR

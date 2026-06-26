@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <climits>
+#include <cstdint>
 #include <vector>
 
 // for still image data, layout is RGBRGBRGB...
@@ -91,7 +92,14 @@ struct mtmd_image_tokens {
     mtmd_pos_type pos = MTMD_POS_TYPE_NORMAL;
     uint32_t image_idx = 0; // 0-based position of this image among image chunks in the prompt(used by pos == MTMD_POS_TYPE_HUNYUANVL)
     uint32_t n_temporal_merge = 1; // for qwen-vl style temporal merge
+    bool deepseek_ocr_gundam = false;
+    uint32_t deepseek_ocr_grid_x = 0;
+    uint32_t deepseek_ocr_grid_y = 0;
+    uint32_t deepseek_ocr_tile_side = 0;
     uint32_t n_tokens() const {
+        if (deepseek_ocr_gundam) {
+            return nx;
+        }
         if (pos == MTMD_POS_TYPE_HUNYUANVL) {
             // [BOI] [row0 tokens + newline] ... [row(ny-1) tokens + newline] [EOI]
             return (nx + 1) * ny + 2;
@@ -122,6 +130,9 @@ struct mtmd_image_tokens {
     }
 
     bool can_batch_with(const mtmd_image_tokens & other) {
+        if (deepseek_ocr_gundam || other.deepseek_ocr_gundam) {
+            return false;
+        }
         return nx == other.nx && ny == other.ny && pos == other.pos;
     }
 
@@ -132,6 +143,10 @@ struct mtmd_image_tokens {
             pos,
             image_idx,
             n_temporal_merge,
+            deepseek_ocr_gundam,
+            deepseek_ocr_grid_x,
+            deepseek_ocr_grid_y,
+            deepseek_ocr_tile_side,
             batch_f32.clone(),
             id
         };
@@ -1106,7 +1121,16 @@ struct mtmd_tokenizer {
             const bool has_tiling_grid = (preproc_out.grid_x > 0 && preproc_out.grid_y > 0)
                 || preproc_out.has_overview();
 
-            if (has_tiling_grid) {
+            const bool has_deepseek_ocr_gundam_grid =
+                ctx->proj_type_v() == PROJECTOR_TYPE_DEEPSEEKOCR
+                && preproc_out.grid_x > 0
+                && preproc_out.grid_y > 0
+                && preproc_out.has_overview();
+
+            if (has_deepseek_ocr_gundam_grid) {
+                cur.entries.emplace_back(make_deepseek_ocr_gundam_chunk(std::move(preproc_out), bitmaps[0]->id));
+
+            } else if (has_tiling_grid) {
                 // [QWEN_VIDEO] we do not support "frame merging" for llama-uhd style, so no batching for now
                 GGML_ASSERT(bitmaps.size() == 1);
 
@@ -1338,6 +1362,67 @@ struct mtmd_tokenizer {
         return 0;
     }
 
+    mtmd_input_chunk make_deepseek_ocr_gundam_chunk(mtmd_image_preproc_out && preproc_out, const std::string & id) {
+        GGML_ASSERT(ctx->ctx_v != nullptr);
+        GGML_ASSERT(preproc_out.grid_x > 0 && preproc_out.grid_y > 0);
+        GGML_ASSERT(preproc_out.has_overview());
+        GGML_ASSERT((int) preproc_out.entries.size() == preproc_out.grid_x * preproc_out.grid_y);
+
+        const size_t local_tokens_per_tile = clip_n_output_tokens(ctx->ctx_v, &preproc_out.entries.front());
+        const uint32_t tile_side = deepseek_ocr_tile_side_from_tokens(local_tokens_per_tile);
+        if (tile_side == 0) {
+            throw std::runtime_error(string_format(
+                "%s: invalid DeepSeek-OCR local tile token count: %zu\n",
+                __func__, local_tokens_per_tile));
+        }
+
+        const size_t global_tokens = clip_n_output_tokens(ctx->ctx_v, &preproc_out.overview);
+        const size_t local_tokens =
+            (size_t) preproc_out.grid_y * tile_side * ((size_t) preproc_out.grid_x * tile_side + 1);
+        const size_t total_tokens = local_tokens + global_tokens;
+        if (total_tokens > UINT32_MAX) {
+            throw std::runtime_error(string_format("%s: too many DeepSeek-OCR image tokens: %zu\n", __func__, total_tokens));
+        }
+
+        mtmd_image_tokens_ptr image_tokens(new mtmd_image_tokens);
+        image_tokens->nx = (uint32_t) total_tokens;
+        image_tokens->ny = 1;
+        image_tokens->pos = ctx->pos_type;
+        image_tokens->deepseek_ocr_gundam = true;
+        image_tokens->deepseek_ocr_grid_x = (uint32_t) preproc_out.grid_x;
+        image_tokens->deepseek_ocr_grid_y = (uint32_t) preproc_out.grid_y;
+        image_tokens->deepseek_ocr_tile_side = tile_side;
+        image_tokens->id = id;
+
+        image_tokens->batch_f32.entries.reserve(preproc_out.entries.size() + 1);
+        for (auto & entry : preproc_out.entries) {
+            image_tokens->batch_f32.entries.emplace_back(std::move(entry));
+        }
+        image_tokens->batch_f32.entries.emplace_back(std::move(preproc_out.overview));
+
+        LOG_DBG("deepseek_ocr_gundam grid = %d x %d, tile_side = %d, image_tokens = %d\n",
+                image_tokens->deepseek_ocr_grid_x,
+                image_tokens->deepseek_ocr_grid_y,
+                image_tokens->deepseek_ocr_tile_side,
+                image_tokens->nx);
+
+        return mtmd_input_chunk{
+            MTMD_INPUT_CHUNK_TYPE_IMAGE,
+            {}, // text tokens
+            std::move(image_tokens),
+            nullptr, // audio tokens
+        };
+    }
+
+    static uint32_t deepseek_ocr_tile_side_from_tokens(size_t n_tokens) {
+        for (uint32_t side = 1; side < 1024; side++) {
+            if ((size_t) side * (side + 1) == n_tokens) {
+                return side;
+            }
+        }
+        return 0;
+    }
+
     std::vector<mtmd_input_chunk> split_batch_to_chunk(mtmd_image_preproc_out && preproc_out, const std::string & id) {
         std::vector<mtmd_input_chunk> chunks;
 
@@ -1439,6 +1524,113 @@ int32_t mtmd_tokenize(mtmd_context * ctx,
     }
 }
 
+static void mtmd_copy_embd_token(
+        std::vector<float> & dst,
+        size_t               dst_token,
+        const std::vector<float> & src,
+        size_t               src_token,
+        size_t               n_embd) {
+    std::copy_n(src.data() + src_token * n_embd, n_embd, dst.data() + dst_token * n_embd);
+}
+
+static bool mtmd_encode_one_image(
+        clip_ctx *              ctx_clip,
+        int                     n_threads,
+        const clip_image_f32 &  image,
+        std::vector<float> &    out_embd) {
+    const size_t n_tokens = clip_n_output_tokens(ctx_clip, &image);
+    const size_t n_embd   = clip_n_mmproj_embd(ctx_clip);
+    out_embd.resize(n_tokens * n_embd);
+
+    clip_image_f32_batch batch;
+    batch.entries.emplace_back(image);
+    return clip_image_batch_encode(ctx_clip, n_threads, &batch, out_embd);
+}
+
+static int32_t mtmd_encode_deepseek_ocr_gundam_impl(
+        mtmd_context *            ctx,
+        const mtmd_image_tokens * image_tokens,
+        std::vector<float> &      out_embd) {
+    clip_ctx * ctx_clip = ctx->ctx_v;
+    GGML_ASSERT(ctx_clip != nullptr);
+
+    const uint32_t grid_x    = image_tokens->deepseek_ocr_grid_x;
+    const uint32_t grid_y    = image_tokens->deepseek_ocr_grid_y;
+    const uint32_t tile_side = image_tokens->deepseek_ocr_tile_side;
+    const size_t   n_tiles   = (size_t) grid_x * grid_y;
+
+    if (grid_x == 0 || grid_y == 0 || tile_side == 0) {
+        LOG_ERR("%s: invalid DeepSeek-OCR gundam grid metadata\n", __func__);
+        return 1;
+    }
+    if (image_tokens->batch_f32.entries.size() != n_tiles + 1) {
+        LOG_ERR("%s: expected %zu local tiles plus one overview, got %zu images\n",
+                __func__, n_tiles, image_tokens->batch_f32.entries.size());
+        return 1;
+    }
+
+    const size_t n_embd         = ctx->n_embd_out();
+    const size_t local_width    = (size_t) grid_x * tile_side;
+    const size_t local_height   = (size_t) grid_y * tile_side;
+    const size_t local_tokens   = local_height * (local_width + 1);
+    const size_t total_tokens   = image_tokens->n_tokens();
+    const size_t expected_local = (size_t) tile_side * (tile_side + 1);
+
+    out_embd.assign(total_tokens * n_embd, 0.0f);
+
+    for (uint32_t tile_y = 0; tile_y < grid_y; tile_y++) {
+        for (uint32_t tile_x = 0; tile_x < grid_x; tile_x++) {
+            const size_t tile_idx = (size_t) tile_y * grid_x + tile_x;
+            const auto & tile = image_tokens->batch_f32.entries[tile_idx];
+            const size_t tile_tokens = clip_n_output_tokens(ctx_clip, &tile);
+            if (tile_tokens != expected_local) {
+                LOG_ERR("%s: expected %zu tokens for local tile %zu, got %zu\n",
+                        __func__, expected_local, tile_idx, tile_tokens);
+                return 1;
+            }
+
+            std::vector<float> tile_embd;
+            if (!mtmd_encode_one_image(ctx_clip, ctx->n_threads, tile, tile_embd)) {
+                LOG_ERR("%s: failed to encode local tile %zu\n", __func__, tile_idx);
+                return 1;
+            }
+
+            for (uint32_t row = 0; row < tile_side; row++) {
+                const size_t dst_row = (size_t) tile_y * tile_side + row;
+                for (uint32_t col = 0; col < tile_side; col++) {
+                    const size_t src_token = (size_t) row * (tile_side + 1) + col;
+                    const size_t dst_token =
+                        dst_row * (local_width + 1) + (size_t) tile_x * tile_side + col;
+                    mtmd_copy_embd_token(out_embd, dst_token, tile_embd, src_token, n_embd);
+                }
+
+                if (tile_x == 0) {
+                    const size_t src_newline = (size_t) row * (tile_side + 1) + tile_side;
+                    const size_t dst_newline = dst_row * (local_width + 1) + local_width;
+                    mtmd_copy_embd_token(out_embd, dst_newline, tile_embd, src_newline, n_embd);
+                }
+            }
+        }
+    }
+
+    const auto & overview = image_tokens->batch_f32.entries.back();
+    std::vector<float> overview_embd;
+    if (!mtmd_encode_one_image(ctx_clip, ctx->n_threads, overview, overview_embd)) {
+        LOG_ERR("%s: failed to encode overview image\n", __func__);
+        return 1;
+    }
+
+    const size_t overview_tokens = clip_n_output_tokens(ctx_clip, &overview);
+    if (local_tokens + overview_tokens != total_tokens) {
+        LOG_ERR("%s: composed token count mismatch: local=%zu overview=%zu total=%zu\n",
+                __func__, local_tokens, overview_tokens, total_tokens);
+        return 1;
+    }
+
+    std::copy_n(overview_embd.data(), overview_embd.size(), out_embd.data() + local_tokens * n_embd);
+    return 0;
+}
+
 static int32_t mtmd_encode_impl(mtmd_context * ctx, const mtmd_image_tokens * image_tokens, std::vector<float> & out_embd) {
     clip_ctx * ctx_clip = ctx->ctx_v;
     if (!ctx_clip) {
@@ -1446,14 +1638,18 @@ static int32_t mtmd_encode_impl(mtmd_context * ctx, const mtmd_image_tokens * im
         return 1;
     }
 
-    int n_embd_out = ctx->n_embd_out();
-    auto n_tokens_out = image_tokens->n_tokens();
-    out_embd.resize((size_t)n_embd_out * n_tokens_out);
-
     if (image_tokens->is_placeholder()) {
         LOG_ERR("%s: image tokens batch is placeholder\n", __func__);
         return 1;
     }
+
+    if (image_tokens->deepseek_ocr_gundam) {
+        return mtmd_encode_deepseek_ocr_gundam_impl(ctx, image_tokens, out_embd);
+    }
+
+    int n_embd_out = ctx->n_embd_out();
+    auto n_tokens_out = image_tokens->n_tokens();
+    out_embd.resize((size_t)n_embd_out * n_tokens_out);
 
     bool ok = clip_image_batch_encode(
         ctx_clip,

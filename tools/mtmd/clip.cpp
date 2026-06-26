@@ -3423,10 +3423,14 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
             // E.g., 64x64 -> 16x16 patches
             n_patches /= 16;
 
-            // build_global_local_features adds image newlines and view separator
-            // Formula: h*(w+1) + 1 where h = w = sqrt(n_patches)
+            // build_global_local_features adds image newlines after each row.
+            // The view separator is appended only for the global/overview image.
+            // Formula: h*(w+1) plus optional view separator, where h = w = sqrt(n_patches).
             int h = static_cast<int>(std::sqrt(static_cast<float>(n_patches)));
-            n_patches = h * (h + 1) + 1;
+            n_patches = h * (h + 1);
+            if (img->add_viewsep) {
+                n_patches += 1;
+            }
         } break;
         case PROJECTOR_TYPE_HUNYUANVL:
             {
