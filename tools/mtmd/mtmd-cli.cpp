@@ -9,6 +9,9 @@
 #include "chat.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#ifdef UOCR_FFI_LIBRARY
+#include "uocr-ffi.h"
+#endif
 
 #include <vector>
 #include <algorithm>
@@ -21,7 +24,10 @@
 #include <clocale>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <mutex>
 #include <sstream>
+#include <stdexcept>
 #include <unordered_set>
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
@@ -709,7 +715,11 @@ struct mtmd_cli_context {
         }
 
         if (!model || !lctx) {
+#ifdef UOCR_FFI_LIBRARY
+            throw std::runtime_error("failed to load language model");
+#else
             exit(1);
+#endif
         }
 
         if (trace.enabled && trace.output_embeddings_enabled) {
@@ -734,7 +744,11 @@ struct mtmd_cli_context {
             LOG_ERR("  For old llava models, you may need to use '--chat-template vicuna'\n");
             LOG_ERR("  For MobileVLM models, use '--chat-template deepseek'\n");
             LOG_ERR("  For Mistral Small 3.1, use '--chat-template mistral-v7'\n");
+#ifdef UOCR_FFI_LIBRARY
+            throw std::runtime_error("model does not have a chat template; pass --chat-template");
+#else
             exit(1);
+#endif
         }
 
         tmpls = common_chat_templates_init(model, params.chat_template);
@@ -774,7 +788,11 @@ struct mtmd_cli_context {
         ctx_vision.reset(mtmd_init_from_file(clip_path, model, mparams));
         if (!ctx_vision.get()) {
             LOG_ERR("Failed to load vision model from %s\n", clip_path);
+#ifdef UOCR_FFI_LIBRARY
+            throw std::runtime_error("failed to load vision model");
+#else
             exit(1);
+#endif
         }
     }
 
@@ -1097,6 +1115,7 @@ static int eval_message(mtmd_cli_context & ctx, common_chat_msg & msg) {
     return 0;
 }
 
+#ifndef UOCR_FFI_LIBRARY
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -1275,3 +1294,402 @@ int main(int argc, char ** argv) {
     }
     return g_is_interrupted ? 130 : 0;
 }
+#endif // UOCR_FFI_LIBRARY
+
+#ifdef UOCR_FFI_LIBRARY
+
+struct uocr_ffi_session {
+    common_params params;
+    std::unique_ptr<mtmd_cli_context> ctx;
+    std::string last_error;
+    uocr_ffi_status last_status = UOCR_FFI_STATUS_OK;
+    std::mutex mutex;
+    uint64_t run_count = 0;
+};
+
+static thread_local std::string g_uocr_ffi_last_error;
+static std::once_flag g_uocr_ffi_init_once;
+
+static void uocr_ffi_set_error(uocr_ffi_session * session, uocr_ffi_status status, const std::string & message) {
+    if (session) {
+        session->last_status = status;
+        session->last_error = message;
+    } else {
+        g_uocr_ffi_last_error = message;
+    }
+}
+
+static const char * uocr_ffi_str(const char * value, const char * fallback = "") {
+    return value && value[0] != '\0' ? value : fallback;
+}
+
+static void uocr_ffi_setenv(const char * name, const std::string & value, bool enabled) {
+#if defined(_WIN32)
+    _putenv_s(name, enabled ? value.c_str() : "");
+#else
+    if (enabled) {
+        setenv(name, value.c_str(), 1);
+    } else {
+        unsetenv(name);
+    }
+#endif
+}
+
+static void uocr_ffi_apply_env(const uocr_ffi_params & input) {
+    uocr_ffi_setenv("LLAMA_DEEPSEEK_OCR_GUNDAM", "1", input.gundam_mode != 0);
+    uocr_ffi_setenv("LLAMA_DEEPSEEK_OCR_NO_IMAGE_END", "1", input.no_image_end != 0);
+
+    const bool no_repeat = input.no_repeat_ngram != 0;
+    uocr_ffi_setenv("LLAMA_DEEPSEEK_OCR_NO_REPEAT_NGRAM", "1", no_repeat);
+    uocr_ffi_setenv("LLAMA_DEEPSEEK_OCR_NGRAM_SIZE", std::to_string(input.ngram_size > 0 ? input.ngram_size : 30), no_repeat);
+    uocr_ffi_setenv("LLAMA_DEEPSEEK_OCR_NGRAM_WINDOW", std::to_string(input.ngram_window > 0 ? input.ngram_window : 90), no_repeat);
+    uocr_ffi_setenv("LLAMA_DEEPSEEK_OCR_NGRAM_WHITELIST", uocr_ffi_str(input.ngram_whitelist, "128821,128822"), no_repeat);
+
+    const bool prefill_swa = input.prefill_aware_swa != 0;
+    uocr_ffi_setenv("LLAMA_DEEPSEEK_OCR_PREFILL_AWARE_SWA", "1", prefill_swa);
+    uocr_ffi_setenv("LLAMA_DEEPSEEK_OCR_LEGACY_KV_PRUNE", "1", prefill_swa && input.legacy_kv_prune != 0);
+    uocr_ffi_setenv("LLAMA_DEEPSEEK_OCR_DECODE_WINDOW", std::to_string(input.decode_window > 0 ? input.decode_window : 128), prefill_swa);
+    uocr_ffi_setenv("LLAMA_DEEPSEEK_OCR_MIN_NEW_TOKENS", std::to_string(input.min_new_tokens), input.min_new_tokens > 0);
+}
+
+static common_params uocr_ffi_parse_params(const uocr_ffi_params & input) {
+    if (!input.model_path || input.model_path[0] == '\0') {
+        throw std::runtime_error("model_path is required");
+    }
+    if (!input.mmproj_path || input.mmproj_path[0] == '\0') {
+        throw std::runtime_error("mmproj_path is required");
+    }
+
+    std::vector<std::string> args;
+    auto add_arg = [&](const std::string & value) {
+        args.push_back(value);
+    };
+
+    add_arg("uocr-ffi");
+    add_arg("-m");
+    add_arg(input.model_path);
+    add_arg("--mmproj");
+    add_arg(input.mmproj_path);
+    add_arg("--chat-template");
+    add_arg(uocr_ffi_str(input.chat_template, "deepseek-ocr"));
+    add_arg("--temp");
+    add_arg("0");
+    add_arg("--top-k");
+    add_arg("1");
+    add_arg("-c");
+    add_arg(std::to_string(input.ctx_size > 0 ? input.ctx_size : 32768));
+    add_arg("-b");
+    add_arg(std::to_string(input.n_batch > 0 ? input.n_batch : 2048));
+    add_arg("-ngl");
+    if (input.n_gpu_layers <= -2) {
+        add_arg("all");
+    } else if (input.n_gpu_layers == -1) {
+        add_arg("auto");
+    } else {
+        add_arg(std::to_string(input.n_gpu_layers));
+    }
+    add_arg("--log-verbosity");
+    add_arg(std::to_string(input.log_verbosity > 0 ? input.log_verbosity : 2));
+    if (input.force_prompt_eos != 0) {
+        add_arg("--override-kv");
+        add_arg("tokenizer.ggml.add_eos_token=bool:true");
+    }
+
+    std::vector<char *> argv;
+    argv.reserve(args.size());
+    for (auto & arg : args) {
+        argv.push_back(const_cast<char *>(arg.c_str()));
+    }
+
+    common_params params;
+    if (!common_params_parse((int) argv.size(), argv.data(), params, LLAMA_EXAMPLE_MTMD, show_additional_info)) {
+        throw std::runtime_error("failed to parse native OCR parameters");
+    }
+    if (params.mmproj.path.empty()) {
+        throw std::runtime_error("mmproj_path is required");
+    }
+    return params;
+}
+
+static void uocr_ffi_runtime_init_once() {
+    std::call_once(g_uocr_ffi_init_once, []() {
+        std::setlocale(LC_NUMERIC, "C");
+        ggml_time_init();
+        common_init();
+        mtmd_helper_log_set(common_log_default_callback, nullptr);
+        ggml_backend_load_all();
+    });
+}
+
+static void uocr_ffi_reset_context(mtmd_cli_context & ctx) {
+    g_is_generating = false;
+    g_is_interrupted = false;
+    ctx.n_past = 0;
+    ctx.chat_history.clear();
+    ctx.no_repeat_origin_tokens.clear();
+    ctx.bitmaps.entries.clear();
+    ctx.videos.clear();
+    ctx.mbatch.reset();
+    common_sampler_reset(ctx.smpl);
+    llama_memory_clear(llama_get_memory(ctx.lctx), true);
+}
+
+static bool uocr_ffi_emit_event(
+        uocr_ffi_event_callback callback,
+        void * user_data,
+        uocr_ffi_event_type type,
+        const std::string & text,
+        uint64_t index) {
+    if (!callback) {
+        return true;
+    }
+    uocr_ffi_event event = {};
+    event.struct_size = sizeof(event);
+    event.type = (uint32_t) type;
+    event.text_utf8 = text.c_str();
+    event.text_len = text.size();
+    event.index = index;
+    return callback(&event, user_data) == 0;
+}
+
+static int uocr_ffi_generate_response(mtmd_cli_context & ctx, int n_predict, uocr_ffi_event_callback callback, void * user_data) {
+    llama_tokens generated_tokens;
+    const llama_pos prefill_end = ctx.n_past;
+    llama_pos decode_kv_removed_until = prefill_end;
+    for (int i = 0; i < n_predict; i++) {
+        if (i > n_predict || !g_is_generating || g_is_interrupted) {
+            if (ctx.trace.stop_reason.empty()) {
+                ctx.trace.stop_reason = g_is_interrupted ? "interrupted" : "stopped";
+            }
+            break;
+        }
+
+        llama_tokens banned = banned_ngram_tokens(
+                ctx.no_repeat_origin_tokens,
+                generated_tokens,
+                ctx.no_repeat_ngram);
+        if (i < ctx.min_new_tokens.n_tokens) {
+            banned.insert(banned.end(), ctx.eog_tokens.begin(), ctx.eog_tokens.end());
+        }
+        std::vector<uocr_trace_top_logit> top_logits;
+        if (ctx.trace.enabled) {
+            top_logits = collect_top_logits(ctx.lctx, ctx.vocab, ctx.trace.top_k);
+        }
+        llama_token token_id = banned.empty()
+            ? common_sampler_sample(ctx.smpl, ctx.lctx, -1)
+            : common_sampler_sample_with_banned(ctx.smpl, ctx.lctx, -1, banned);
+        generated_tokens.push_back(token_id);
+        common_sampler_accept(ctx.smpl, token_id, true);
+        const bool is_eog = llama_vocab_is_eog(ctx.vocab, token_id);
+        const bool is_antiprompt = ctx.check_antiprompt(generated_tokens);
+
+        if (ctx.trace.enabled) {
+            uocr_trace_generation_step step;
+            step.index = i;
+            step.token_id = token_id;
+            step.piece = common_token_to_piece(ctx.lctx, token_id);
+            step.is_eog = is_eog;
+            step.is_antiprompt = is_antiprompt;
+            step.raw_top_rank = rank_in_top_logits(top_logits, token_id);
+            step.banned_tokens = banned;
+            step.top_logits = std::move(top_logits);
+            ctx.trace.generation.push_back(std::move(step));
+        }
+
+        if (is_eog || is_antiprompt) {
+            if (ctx.trace.stop_reason.empty()) {
+                ctx.trace.stop_reason = is_eog ? "eog" : "antiprompt";
+            }
+            break;
+        }
+
+        std::string piece = common_token_to_piece(ctx.lctx, token_id);
+        if (!piece.empty()) {
+            if (!uocr_ffi_emit_event(callback, user_data, UOCR_FFI_EVENT_TOKEN, piece, generated_tokens.size() - 1)) {
+                ctx.trace.stop_reason = "cancelled";
+                return 130;
+            }
+        }
+
+        if (g_is_interrupted) {
+            break;
+        }
+
+        common_batch_clear(ctx.batch);
+        common_batch_add(ctx.batch, token_id, ctx.n_past++, {0}, true);
+        if (llama_decode(ctx.lctx, ctx.batch)) {
+            LOG_ERR("failed to decode token\n");
+            return 1;
+        }
+        if (ctx.trace.enabled && ctx.trace.output_embeddings_enabled) {
+            ctx.trace.output_embeddings.push_back(summarize_output_embedding(
+                        "generation",
+                        i,
+                        token_id,
+                        llama_get_embeddings_ith(ctx.lctx, -1),
+                        llama_model_n_embd(ctx.model)));
+        }
+
+        if (!prune_decode_history(
+                    ctx.lctx,
+                    ctx.prefill_aware_swa,
+                    prefill_end,
+                    ctx.n_past,
+                    decode_kv_removed_until)) {
+            return 1;
+        }
+    }
+    if (ctx.trace.enabled && ctx.trace.stop_reason.empty()) {
+        ctx.trace.stop_reason = generated_tokens.size() >= (size_t) n_predict ? "length" : "stopped";
+    }
+
+    std::string generated_text = common_detokenize(ctx.lctx, generated_tokens);
+    common_chat_msg msg;
+    msg.role    = "assistant";
+    msg.content = generated_text;
+    ctx.chat_history.push_back(std::move(msg));
+
+    return 0;
+}
+
+extern "C" {
+
+uint32_t uocr_ffi_abi_version(void) {
+    return UOCR_FFI_ABI_VERSION;
+}
+
+const char * uocr_ffi_build_info(void) {
+    return "uocr-ffi/1";
+}
+
+const char * uocr_ffi_media_marker(void) {
+    return mtmd_default_marker();
+}
+
+uocr_ffi_session * uocr_ffi_create(const uocr_ffi_params * params) {
+    g_uocr_ffi_last_error.clear();
+    if (!params) {
+        g_uocr_ffi_last_error = "params is null";
+        return nullptr;
+    }
+    if (params->struct_size < sizeof(uocr_ffi_params)) {
+        g_uocr_ffi_last_error = "unsupported uocr_ffi_params struct_size";
+        return nullptr;
+    }
+
+    try {
+        uocr_ffi_runtime_init_once();
+        uocr_ffi_apply_env(*params);
+        std::unique_ptr<uocr_ffi_session> session(new uocr_ffi_session());
+        session->params = uocr_ffi_parse_params(*params);
+        session->ctx.reset(new mtmd_cli_context(session->params));
+        return session.release();
+    } catch (const std::exception & exc) {
+        g_uocr_ffi_last_error = exc.what();
+    } catch (...) {
+        g_uocr_ffi_last_error = "unknown error creating uocr ffi session";
+    }
+    return nullptr;
+}
+
+void uocr_ffi_destroy(uocr_ffi_session * session) {
+    delete session;
+}
+
+uocr_ffi_status uocr_ffi_run_image(uocr_ffi_session * session, const uocr_ffi_request * request) {
+    if (!session) {
+        g_uocr_ffi_last_error = "session is null";
+        return UOCR_FFI_STATUS_INVALID_ARGUMENT;
+    }
+    if (!request) {
+        uocr_ffi_set_error(session, UOCR_FFI_STATUS_INVALID_ARGUMENT, "request is null");
+        return UOCR_FFI_STATUS_INVALID_ARGUMENT;
+    }
+    if (request->struct_size < sizeof(uocr_ffi_request)) {
+        uocr_ffi_set_error(session, UOCR_FFI_STATUS_UNSUPPORTED_ABI, "unsupported uocr_ffi_request struct_size");
+        return UOCR_FFI_STATUS_UNSUPPORTED_ABI;
+    }
+    if (!request->image_path || request->image_path[0] == '\0') {
+        uocr_ffi_set_error(session, UOCR_FFI_STATUS_INVALID_ARGUMENT, "image_path is required");
+        return UOCR_FFI_STATUS_INVALID_ARGUMENT;
+    }
+
+    std::lock_guard<std::mutex> guard(session->mutex);
+    session->last_error.clear();
+    session->last_status = UOCR_FFI_STATUS_OK;
+    try {
+        mtmd_cli_context & ctx = *session->ctx;
+        uocr_ffi_reset_context(ctx);
+
+        std::string prompt = uocr_ffi_str(request->prompt, "document parsing.");
+        if (prompt.find(mtmd_default_marker()) == std::string::npos) {
+            prompt = std::string(mtmd_default_marker()) + prompt;
+        }
+
+        common_chat_msg msg;
+        msg.role = "user";
+        msg.content = prompt;
+
+        g_is_generating = true;
+        if (!ctx.load_media(request->image_path)) {
+            throw std::runtime_error("failed to load image");
+        }
+        if (eval_message(ctx, msg)) {
+            throw std::runtime_error("failed to evaluate image prompt");
+        }
+
+        const int n_predict = request->max_tokens > 0 ? request->max_tokens : INT_MAX;
+        if (!g_is_interrupted) {
+            const int generation_status = uocr_ffi_generate_response(ctx, n_predict, request->event_callback, request->user_data);
+            if (generation_status == 130) {
+                throw std::runtime_error("cancelled");
+            }
+            if (generation_status) {
+                throw std::runtime_error("failed during token generation");
+            }
+        }
+
+        if (ctx.trace.enabled) {
+            ctx.trace.final_n_past = ctx.n_past;
+            write_uocr_trace(ctx.trace);
+        }
+        g_is_generating = false;
+        session->run_count++;
+        if (g_is_interrupted) {
+            uocr_ffi_set_error(session, UOCR_FFI_STATUS_CANCELLED, "interrupted");
+            return UOCR_FFI_STATUS_CANCELLED;
+        }
+        uocr_ffi_emit_event(request->event_callback, request->user_data, UOCR_FFI_EVENT_DONE, "", session->run_count);
+        return UOCR_FFI_STATUS_OK;
+    } catch (const std::exception & exc) {
+        g_is_generating = false;
+        const std::string message = exc.what();
+        uocr_ffi_set_error(
+                session,
+                message == "cancelled" ? UOCR_FFI_STATUS_CANCELLED : UOCR_FFI_STATUS_RUN_FAILED,
+                message);
+    } catch (...) {
+        g_is_generating = false;
+        uocr_ffi_set_error(session, UOCR_FFI_STATUS_ERROR, "unknown error running OCR");
+    }
+    return session->last_status;
+}
+
+const char * uocr_ffi_last_error(uocr_ffi_session * session) {
+    if (session) {
+        return session->last_error.c_str();
+    }
+    return g_uocr_ffi_last_error.c_str();
+}
+
+uocr_ffi_status uocr_ffi_last_status(uocr_ffi_session * session) {
+    return session ? session->last_status : UOCR_FFI_STATUS_ERROR;
+}
+
+uint64_t uocr_ffi_run_count(uocr_ffi_session * session) {
+    return session ? session->run_count : 0;
+}
+
+} // extern "C"
+
+#endif // UOCR_FFI_LIBRARY

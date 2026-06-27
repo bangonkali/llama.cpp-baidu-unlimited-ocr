@@ -143,6 +143,16 @@ if (LLAMA_BUILD_TOOLS)
     target_link_libraries  (${TARGET} PRIVATE llama-common mtmd Threads::Threads)
     target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
+    set(TARGET uocr-ffi)
+    add_library            (${TARGET} SHARED mtmd-cli.cpp uocr-ffi.h)
+    set_target_properties  (${TARGET} PROPERTIES OUTPUT_NAME uocr-ffi)
+    if(LLAMA_TOOLS_INSTALL)
+        install(TARGETS ${TARGET} RUNTIME LIBRARY)
+    endif()
+    target_compile_definitions(${TARGET} PRIVATE UOCR_FFI_LIBRARY UOCR_FFI_BUILD)
+    target_link_libraries  (${TARGET} PRIVATE llama-common mtmd Threads::Threads)
+    target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
     # mtmd-debug tool
     add_executable(llama-mtmd-debug debug/mtmd-debug.cpp)
     set_target_properties(llama-mtmd-debug PROPERTIES OUTPUT_NAME llama-mtmd-debug)
